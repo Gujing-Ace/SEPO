@@ -3,6 +3,7 @@ import sys
 import torch
 from dataclasses import dataclass, field
 from typing import Optional
+from src.train.train_utils import get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3, safe_save_model_for_hf_trainer
 
 # Adjust path to import from parent directory's src
 # This assumes train_sepo.py is run from within the 'sepo' directory or the project root is in PYTHONPATH
@@ -33,10 +34,6 @@ try:
     DEFAULT_EOS_TOKEN = "<|endoftext|>"
     DEFAULT_BOS_TOKEN = "<|endoftext|>"
     DEFAULT_UNK_TOKEN = "<|endoftext|>"
-    try:
-        from src.train.train_utils import safe_save_model_for_hf_trainer
-    except ImportError:
-        pass
     # Monkey patching for Qwen models if needed (copied from original train_dpo.py)
     try:
         from src.train.monkey_patch_forward import replace_qwen2_5_with_mixed_modality_forward, replace_qwen_2_with_mixed_modality_forward
@@ -106,6 +103,9 @@ class SEPOTrainingArguments(SrcTrainingArguments): # Inherit from the one in src
     # Add any other SEPO specific training arguments here
 
 def train():
+    # Enable anomaly detection for debugging
+    torch.autograd.set_detect_anomaly(True)
+    
     parser = HfArgumentParser((BaseModelArguments, DataArguments, SEPOTrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
@@ -161,7 +161,7 @@ def train():
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_args.model_id,
         cache_dir=training_args.cache_dir,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, # Use bfloat16 if available for 8GB
+        torch_dtype=torch.float32,  # Force float32 for stability
         quantization_config=quantization_config,
         device_map={"":torch.cuda.current_device()} if quantization_config else "auto", # device_map for quantization
         trust_remote_code=True,
@@ -234,11 +234,21 @@ def train():
     # Start training
     trainer.train()
 
-    # Save model
-    # trainer.save_state() # Saves trainer state
-    # safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
-    model.save_pretrained(training_args.output_dir)
-    processor.save_pretrained(training_args.output_dir)
+    if training_args.lora_enable:
+        state_dict = get_peft_state_maybe_zero_3(
+            model.named_parameters(), training_args.lora_bias
+        )
+
+        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
+            model.named_parameters(), require_grad_only=True
+        )
+
+        if local_rank == 0 or local_rank == -1:
+            model.config.save_pretrained(training_args.output_dir)
+            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+            torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_state_dict.bin"))
+    else:
+        safe_save_model_for_hf_trainer(trainer, output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":

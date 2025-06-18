@@ -3,19 +3,19 @@
 # You can use 2B instead of 7B
 # MODEL_NAME="Qwen/Qwen2-VL-7B-Instruct"
 # MODEL_NAME="Qwen/Qwen2-VL-2B-Instruct"
-MODEL_NAME="Qwen/Qwen2.5-VL-3B-Instruct"
+MODEL_NAME="/root/autodl-tmp/SEPO/sepo/models/Qwen2.5-VL-3B-Instruct"
 # MODEL_NAME="Qwen/Qwen2.5-VL-7B-Instruct"
 
 GLOBAL_BATCH_SIZE=128
 BATCH_PER_DEVICE=4
-NUM_DEVICES=8
+NUM_DEVICES=1
 GRAD_ACCUM_STEPS=$((GLOBAL_BATCH_SIZE / (BATCH_PER_DEVICE * NUM_DEVICES)))
 
 export PYTHONPATH=src:$PYTHONPATH
 
 deepspeed src/train/train_sft.py \
     --use_liger True \
-    --deepspeed scripts/zero3_offload.json \
+    --deepspeed scripts/zero2_offload.json \
     --model_id $MODEL_NAME \
     --data_path /path/to/your/training/data.json \
     --image_folder /path/to/your/image/folder \

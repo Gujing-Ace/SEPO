@@ -170,7 +170,7 @@ logs/*.log
 testing.ipynb
 
 sepo/data/
+sepo/eval_data/
 sepo/models/
 sepo/output_sepo_test/
-sepo/ToDo.md
 .vscode

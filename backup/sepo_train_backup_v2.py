@@ -27,9 +27,7 @@ class LowRankNoiseInjection(nn.Module):
                 'gate_proj' in name or
                 'up_proj' in name or
                 'down_proj' in name or
-                'lm_head' in name or
-                'input_layernorm.weight' in name or
-                'post_attention_layernorm.weight' in name) and len(param.shape) == 2:
+                'lm_head' in name) and len(param.shape) == 2:
                 safe_name = re.sub(r'\.', '_', name)
                 dim_rows, dim_cols = param.shape
                 U = nn.Parameter(torch.randn(dim_rows, self.rank)) * 0.02
@@ -85,12 +83,8 @@ class RankAdaptor:
                 self.current_rank = max(self.current_rank - 1, 1)
 
 class SEPOTrainer(Trainer):
-    def __init__(self, *args, topk_ratio: float = 0.5, **kwargs):
+    def __init__(self, *args, topk_ratio: float = 0.2, **kwargs):
         super().__init__(*args, **kwargs)
-        # Enable hidden states output only
-        self.model.config.output_hidden_states = True
-        self.model.config.output_attentions = False  # Disable due to model implementation issues
-        
         self.noise_injector = LowRankNoiseInjection(self.model)
         self.rank_adaptor = RankAdaptor()
         self.topk_ratio = topk_ratio
@@ -123,18 +117,6 @@ class SEPOTrainer(Trainer):
         # 移除噪声注入，获取 chosen 样本的输出
         original_model = self.noise_injector.model
         outputs_chosen = original_model(**model_inputs)
-        
-        # 调试输出 - 检查模型输出结构
-        # print("\n=== Model Output Structure Debug ===")
-        # print(f"Output object type: {type(outputs_chosen)}")
-        # print(f"Output attributes: {dir(outputs_chosen)}")
-        # if hasattr(outputs_chosen, 'last_hidden_state'):
-        #     print(f"last_hidden_state shape: {outputs_chosen.last_hidden_state.shape}")
-        # if hasattr(outputs_chosen, 'hidden_states'):
-        #     print(f"hidden_states length: {len(outputs_chosen.hidden_states) if outputs_chosen.hidden_states else 0}")
-        # if hasattr(outputs_chosen, 'attentions'):
-        #     print(f"attentions length: {len(outputs_chosen.attentions) if outputs_chosen.attentions else 0}")
-        # print("==================================\n")
 
         # 2. Calculate DPO loss
         logits_chosen = outputs_chosen.logits
@@ -166,15 +148,6 @@ class SEPOTrainer(Trainer):
         log_probs_chosen = get_logprobs(logits_chosen, labels)
         log_probs_rejected = get_logprobs(logits_rejected, labels)
 
-        # ce loss
-        logits = outputs_chosen.logits
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        ce_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=IGNORE_INDEX
-        )
         # DPO 损失计算的超参数
         beta = 0.1
 
@@ -184,25 +157,21 @@ class SEPOTrainer(Trainer):
 
         # 3. Calculate enhanced multimodal alignment reward
         mm_reward = 0
-        if "pixel_values" in inputs and hasattr(outputs_chosen, 'hidden_states') and outputs_chosen.hidden_states:
-            # print("MMReward from hidden_states Enabled!\n")
-            # Get last layer hidden states
-            hidden_states = outputs_chosen.hidden_states[-1]  # [batch, seq_len, dim]
+        if "pixel_values" in inputs and hasattr(outputs_chosen, 'cross_attentions'):
+            # Use cross attention weights for alignment
+            cross_attn = outputs_chosen.cross_attentions[-1]  # Last layer attention
+            # Average attention across heads and layers
+            attn_weights = torch.mean(cross_attn, dim=1)  # [batch, seq_len, num_patches]
             
-            # Use first token as image feature, last token as text feature
-            image_features = hidden_states[:, 0, :]  # First token
-            text_features = hidden_states[:, -1, :]  # Last token
+            # Get most attended regions (top-k attention)
+            top_k = min(5, attn_weights.size(-1))  # Use top 5 attended regions
+            top_attn = torch.topk(attn_weights, k=top_k, dim=-1)
             
-            # Normalize features
-            image_features = F.normalize(image_features, dim=-1)
-            text_features = F.normalize(text_features, dim=-1)
-            
-            # Compute alignment score (avoiding cosine similarity)
-            # Using negative L2 distance between normalized features
-            mm_reward = -torch.norm(image_features - text_features, p=2, dim=-1).mean()
+            # Calculate alignment score as mean of top attended regions
+            mm_reward = torch.mean(top_attn.values)
 
         # 4. Combine losses with configurable weights
-        total_loss = dpo_loss * 0.6 - mm_reward * 0.2 + ce_loss * 0.2  
+        total_loss = dpo_loss * 0.7 - mm_reward * 0.3  # 70% DPO loss, 30% alignment reward
 
         # 5. Update rank adaptor based on combined performance
         self.rank_adaptor.update_rank((1 - dpo_loss.item() + mm_reward) / 2)
